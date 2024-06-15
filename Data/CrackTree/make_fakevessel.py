@@ -100,6 +100,7 @@ class LSystem_vessel():
         self.rules_7 = rules_7
         self.rules_8 = rules_8
 '''
+        print('aa')
         self.iteration = iteration
         self.width = width
         self.theta = theta
