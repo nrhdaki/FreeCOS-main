@@ -94,12 +94,11 @@ class LSystem_vessel():
         self.rules_2 = rules_2
         self.rules_3 = rules_3
         self.rules_4 = rules_4
-        '''
         self.rules_5 = rules_5
         self.rules_6 = rules_6
         self.rules_7 = rules_7
         self.rules_8 = rules_8
-'''
+
         self.iteration = iteration
         self.width = width
         self.theta = theta
