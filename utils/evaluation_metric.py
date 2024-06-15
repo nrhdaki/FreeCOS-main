@@ -78,8 +78,8 @@ def jc(pred, gt):
     """
     result = pred.cpu().numpy()
     reference = gt.cpu().numpy()
-    result = np.atleast_1d(result.astype(np.bool))
-    reference = np.atleast_1d(reference.astype(np.bool))
+    result = np.atleast_1d(result.astype(np.bool_))
+    reference = np.atleast_1d(reference.astype(np.bool_))
 
     intersection = np.count_nonzero(result & reference)
     union = np.count_nonzero(result | reference)

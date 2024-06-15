@@ -4,7 +4,7 @@ from scipy.ndimage.filters import gaussian_filter
 from scipy.ndimage.interpolation import map_coordinates
 import PIL.Image as Image
 import os
-import elasticdeform
+#import elasticdeform
 
 def elastic_transform(image, alpha, sigma,
                       alpha_affine, random_state=None):

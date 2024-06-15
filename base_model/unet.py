@@ -5,7 +5,7 @@ import torch.nn.functional as F
 import torch.utils.data
 import torch
 from base_model.modules import IBN
-from base_model.contrastive_head import ContrastiveHead_torch,  ContrastiveHead_myself
+from base_model.contrastive_head import ContrastiveHead_myself
 
 class conv_block(nn.Module):
     """

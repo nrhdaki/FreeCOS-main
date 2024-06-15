@@ -14,9 +14,10 @@ import torch.distributed as dist
 import torch.backends.cudnn as cudnn
 
 from config import config
-from dataloader import get_train_loader,get_val_loader
-from network import Network, Network_UNet,SingleUNet_featureDA, Single_contrast_UNet
-from dataloader import XCAD
+#from dataloader import get_train_loader,get_val_loader
+
+from network import Single_contrast_UNet
+#from dataloader import XCAD
 from utils.init_func import init_weight, group_weight
 from engine.lr_policy import WarmUpPolyLR
 from utils.evaluation_metric import computeF1, compute_allXCAD, compute_allRetinal
@@ -24,7 +25,7 @@ from Datasetloader.dataset import CSDataset
 from common.logger import Logger
 import csv
 import PIL.Image as Image
-from network import SingleUNet
+#from network import SingleUNet
 
     #定义一个用于解析命令行参数并返回配置文件的路径的函数
 def get_parser():
@@ -87,15 +88,15 @@ def main():
     model = Single_contrast_UNet(4, config.num_classes) 
     #model = SingleUNet_featureDA(4, config.num_classes)
     #model = Network_UNet(1,config.num_classes)
-    print('# available GPUs: %d' % torch.cuda.device_count())
-    if torch.cuda.device_count() > 1:
-        model = model.cuda()
-        model = nn.DataParallel(model)
-        print('Use GPU Parallel.')
-    elif torch.cuda.is_available():
-        model = model.cuda()
-    else:
-        model = model
+    # print('# available GPUs: %d' % torch.cuda.device_count())
+    # if torch.cuda.device_count() > 1:
+    #     model = model.cuda()
+    #     model = nn.DataParallel(model)
+    #     print('Use GPU Parallel.')
+    # elif torch.cuda.is_available():
+    model = model.cuda()
+    # else:
+    #     model = model
 
     mode_dict = {}
     if config.model_weight:
@@ -244,10 +245,10 @@ def evaluate(model, dataloader):
 #相比evaluate函数添加了对预测结果二值化的步骤（thresh）
 def evaluate_thresh(model, dataloader,thresh):
     # Force randomness during training / freeze randomness during testing
-    if torch.cuda.device_count() > 1:
-        model.module.eval()
-    else:
-        model.eval()
+    # if torch.cuda.device_count() > 1:
+    #     model.module.eval()
+    # else:
+    model.eval()
     val_sum_f1 = 0
     val_sum_pr = 0
     val_sum_re = 0

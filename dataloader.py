@@ -6,7 +6,7 @@ from torch.utils import data
 import random
 from config import config
 from utils.img_utils import generate_random_crop_pos, random_crop_pad_to_shape
-from datasets.BaseDataset import BaseDataset
+#from datasets.BaseDataset import BaseDataset
 from utils.LIOT_torch import trans_liot
 from utils.FDA import FDA_source_to_target
 

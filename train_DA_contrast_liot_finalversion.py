@@ -14,9 +14,9 @@ import torch.distributed as dist
 import torch.backends.cudnn as cudnn
 
 from config import config
-from dataloader import get_train_loader, get_val_loader
+#from dataloader import get_train_loader, get_val_loader
 from network import Network, Network_UNet, SingleUNet, Single_IBNUNet, Single_contrast_UNet
-from dataloader import XCAD
+#from dataloader import XCAD
 from utils.init_func import init_weight, group_weight
 from utils.data_disturb import noise_input
 from engine.lr_policy import WarmUpPolyLR, CosinLR
@@ -74,13 +74,14 @@ def check_feature(sample_set_sup, sample_set_unsup):
 def train(epoch, Segment_model, predict_Discriminator_model, dataloader_supervised, dataloader_unsupervised,
           optimizer_l, optimizer_D, lr_policy, lrD_policy, criterion, total_iteration, average_posregion,
           average_negregion):
-    if torch.cuda.device_count() > 1:
-        Segment_model.module.train()
-        predict_Discriminator_model.module.train()
-    else:
-        print("start_model_train")
-        Segment_model.train()
-        predict_Discriminator_model.train()
+    # if torch.cuda.device_count() > 1:
+    #     Segment_model.module.train()
+    #     predict_Discriminator_model.module.train()
+    #else:
+    print("start_model_train")
+    Segment_model.train()
+    predict_Discriminator_model.train()
+    
     bar_format = '{desc}[{elapsed}<{remaining},{rate_fmt}]'
     pbar = tqdm(range(config.niters_per_epoch), file=sys.stdout, bar_format=bar_format)
     dataloader = iter(dataloader_supervised)
@@ -106,7 +107,7 @@ def train(epoch, Segment_model, predict_Discriminator_model, dataloader_supervis
         optimizer_l.zero_grad()
         optimizer_D.zero_grad()
         try:
-            minibatch = dataloader.next()
+            minibatch = next(dataloader)
         except StopIteration:
             dataloader = iter(dataloader_supervised)
             minibatch = dataloader.next()

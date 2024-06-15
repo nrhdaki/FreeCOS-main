@@ -26,9 +26,9 @@ else:
 
 """please config ROOT_dir and user when u first using"""
 C.repo_name = 'TorchSemiSeg'
-C.datapath = "/data/sty/Unsupervised_dxh/Data/XCAD"
-C.benchmark = 'XCAD_LIOT'#XCAD_LIOT
-C.logname = 'test_XCADmodel'
+C.datapath = "./Data/CrackTree"# XCAD
+C.benchmark = 'Cracktree_LIOT'  # XCAD_LIOT
+C.logname = 'test_CrackTreemodel'
 #next experiment memory
 C.log_dir = "/data/sty/Unsupervised_dxh"
 exp_time = time.strftime('%Y_%m_%d_%H_%M_%S', time.localtime())
@@ -48,7 +48,7 @@ C.val_gt_root_folder = C.dataset_path + "/test/gt"
 C.pretrained_model = C.volna +  'DATA/pytorch-weight/resnet50_v1c.pth'
 
 # model path
-C.model_weight = '/data/sty/Unsupervised_dxh/logs/contrast_repeatnce4_negall_Nce_allpixel_noise.log/best_Segment.pt'
+C.model_weight = '/workspace/yangyi/FreeCOS-main/logs/contrast_repeatnce4_negall_Nce_allpixel_noise.log/best_Segment.pt'
 
 """Path Config"""
 
