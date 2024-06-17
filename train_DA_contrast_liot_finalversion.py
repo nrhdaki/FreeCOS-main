@@ -3,9 +3,13 @@ import os.path as osp
 import os
 import sys
 import time
-import math
+import random
 import argparse
 from tqdm import tqdm
+import PIL.Image
+
+from datetime import datetime
+from torchvision.utils import save_image
 
 import torch
 import torch.nn as nn
@@ -14,15 +18,17 @@ import torch.distributed as dist
 import torch.backends.cudnn as cudnn
 
 from config import config
-#from dataloader import get_train_loader, get_val_loader
-from network import Network, Network_UNet, SingleUNet, Single_IBNUNet, Single_contrast_UNet
-#from dataloader import XCAD
+# from dataloader import get_train_loader, get_val_loader
+# from network import Network, Network_UNet, SingleUNet, Single_IBNUNet, Single_contrast_UNet
+
+# from dataloader import XCAD
 from utils.init_func import init_weight, group_weight
 from utils.data_disturb import noise_input
 from engine.lr_policy import WarmUpPolyLR, CosinLR
 from utils.evaluation_metric import computeF1, compute_allRetinal
 from Datasetloader.dataset import CSDataset
 from common.logger import Logger
+from common.logger import AverageMeter
 import csv
 from utils.loss_function import DiceLoss, Contrastloss, ContrastRegionloss, ContrastRegionloss_noedge, \
     ContrastRegionloss_supunsup, ContrastRegionloss_NCE, ContrastRegionloss_AllNCE, ContrastRegionloss_quaryrepeatNCE, Triplet
@@ -30,12 +36,489 @@ import copy
 from base_model.discriminator import PredictDiscriminator, PredictDiscriminator_affinity
 from base_model.feature_memory import FeatureMemory_TWODomain_NC
 import numpy as np
+from tensorboardX import SummaryWriter
 
-def create_csv(path, csv_head):
-    with open(path, 'w', newline='') as f:
-        csv_write = csv.writer(f)
-        # csv_head = ["good","bad"]
-        csv_write.writerow(csv_head)
+torch.cuda.set_device(0)
+
+class conv_block(nn.Module):
+    """
+    Convolution Block
+    """
+
+    def __init__(self, in_ch, out_ch):
+        super(conv_block, self).__init__()
+
+        self.conv = nn.Sequential(
+            nn.Conv2d(in_ch, out_ch, kernel_size=3, stride=1, padding=1, bias=True),
+            nn.BatchNorm2d(out_ch),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(out_ch, out_ch, kernel_size=3, stride=1, padding=1, bias=True),
+            nn.BatchNorm2d(out_ch),
+            nn.ReLU(inplace=True))
+
+    def forward(self, x):
+        x = self.conv(x)
+        return x
+
+
+class up_conv(nn.Module):
+    """
+    Up Convolution Block
+    """
+
+    def __init__(self, in_ch, out_ch):
+        super(up_conv, self).__init__()
+        self.up = nn.Sequential(
+            nn.Upsample(scale_factor=2),
+            nn.Conv2d(in_ch, out_ch, kernel_size=3, stride=1, padding=1, bias=True),
+            nn.BatchNorm2d(out_ch),
+            nn.ReLU(inplace=True)
+        )
+
+    def forward(self, x):
+        x = self.up(x)
+        return x
+
+
+class linear_block(nn.Module):
+    """
+    Convolution Block
+    """
+
+    def __init__(self, in_ch, out_ch):
+        super(linear_block, self).__init__()
+
+        self.lnearconv = nn.Sequential(
+            nn.Linear(in_ch, out_ch),
+            nn.BatchNorm1d(out_ch),
+            nn.ReLU(inplace=True))
+
+    def forward(self, x):
+        x = self.lnearconv(x)
+        return x
+
+
+def mask2edge(seg):
+    laplacian_kernel = torch.tensor(
+        [-1, -1, -1, -1, 8, -1, -1, -1, -1],
+        dtype=torch.float32, device=seg.device).reshape(1, 1, 3, 3).requires_grad_(False)
+    # print("seg",torch.unique(seg))
+    edge_targets = F.conv2d(seg, laplacian_kernel, padding=1)
+    edge_targets = edge_targets.clamp(min=0)
+    edge_targets[edge_targets > 0.1] = 1
+    edge_targets[edge_targets <= 0.1] = 0
+    return edge_targets
+
+
+def get_query_keys_eval(cams):
+    """
+        Input
+            cams: Tensor, cuda, Nx1x28x28
+
+        Here, when performing evaluation, only cams are provided for all categories, including base and novel.
+    """
+    return_result = dict()
+    cams = cams.squeeze(1).cpu()
+    cams = normalize_zero_to_one(cams)  # tensor  shape:N,28,28, 0-1
+
+    # we only need queries
+    query_pos_sets = torch.where(cams > 0.92, 1.0, 0.0).to(dtype=torch.bool)
+    query_neg_sets = torch.where(cams < 0.08, 1.0, 0.0).to(dtype=torch.bool)
+
+    return_result['query_pos_sets'] = query_pos_sets
+    return_result['query_neg_sets'] = query_neg_sets
+
+    return return_result
+
+
+def normalize_zero_to_one(imgs):
+    if isinstance(imgs, torch.Tensor):
+        bs, h, w = imgs.shape
+        imgs_mins = getattr(imgs.view(bs, -1).min(1), 'values').view(bs, 1, 1)
+        imgs_maxs = getattr(imgs.view(bs, -1).max(1), 'values').view(bs, 1, 1)
+        return (imgs - imgs_mins) / (imgs_maxs - imgs_mins)
+    else:
+        raise TypeError(f'Only tensor is supported!')
+
+
+def get_pixel_sets_N_myself(src_sets, select_num):
+    return_ = []
+    if isinstance(src_sets, torch.Tensor):
+        bs, c, h, w = src_sets.shape
+        flag = True
+        if torch.where(src_sets > 0.5, 1, 0).shape[0] == 0:
+            flag = False
+            return src_sets, False
+        keeps_all = torch.where(src_sets > 0.5, 1, 0).reshape(bs, -1)  # get the right area point
+        for idx, keeps in enumerate(keeps_all):
+            keeps_init = np.zeros_like(keeps.cpu())  # For 1204
+            src_set_index = np.arange(len(keeps))
+            src_set_index_keeps = src_set_index[keeps.cpu().numpy().astype(bool)]  # For 1204
+            select_num[idx] = int(select_num[idx]) if int(select_num[idx]) < 500 else 500
+            resultList = random.sample(range(0, len(src_set_index_keeps)), int(select_num[idx]))
+            src_set_index_keeps_select = src_set_index_keeps[resultList]
+            keeps_init[src_set_index_keeps_select] = 1
+            return_.append(torch.tensor(keeps_init).reshape(1, h, w))
+    else:
+        raise ValueError(f'only tensor is supported!')
+    return_ = [aa.tolist() for aa in return_]  # For 1207
+    return torch.tensor(return_) * src_sets, flag
+
+
+def get_query_keys_myself(
+        edges,
+        masks=None,
+        thred_u=0.1,
+        scale_u=1.0,
+        percent=0.3,
+        fake=True):
+    """
+        Input
+            edges: Tensor, cuda, Nx28x28
+            masks: Tensor, cuda, Nx28x28 is the mask or prediction 0-1 0r [0,1]
+    """
+    #######################################################
+    # ---------- some pre-processing -----------------------
+    #######################################################
+    masks = masks.cpu()  # to cpu, Nx28x28
+    #######################################################
+    # ---------- get query mask for each proposal ----------#
+    #######################################################
+    if fake:
+        # write_tensormap(masks, "mask.png")
+        query_pos_sets = masks.to(dtype=torch.bool)  # here, pos=foreground area  neg=background area
+        query_neg_sets = torch.logical_not(query_pos_sets)  # the background
+        edges = edges.cpu()  # to cpu, Nx28x28 # 8 1 256 256
+    else:
+        pos_masks = torch.where(masks > (1 - thred_u), 1.0, 0.0).to(dtype=torch.bool)  # greater 0.9
+        neg_mask = torch.where(masks < thred_u, 1.0, 0.0).to(dtype=torch.bool)  # less than 0.1
+        query_pos_sets = pos_masks.to(dtype=torch.bool)  # here, pos=foreground area  neg=background area
+        query_neg_sets = neg_mask.to(dtype=torch.bool)  # 8 1 256 256
+    #######################################################
+    # ----------- get different types of keys -------------
+    #######################################################
+    # different sets, you can refer to the figure in https://blog.huiserwang.site/2022-03/Project-ContrastMask/ to easily understand.
+    if fake:  # fakedata  with mask
+        # for all region
+        label_positive_sets = torch.where(masks > (1.0 - thred_u * scale_u), 1.0,
+                                           0.0)  # scale_u can adjust the threshold, it is not used in our paper.
+        label_negative_sets = torch.where(masks < (thred_u * scale_u), 1.0, 0.0)
+        easy_positive_sets = label_positive_sets
+        easy_negative_sets = label_negative_sets
+        hard_positive_sets = label_positive_sets
+        hard_negative_sets = label_negative_sets
+
+    else:
+        # for novel(unseen), get keys according to cam, hard and easy are both sampled in the same sets, replace original sets
+        unseen_positive_sets = torch.where(masks > (1.0 - thred_u * scale_u), 1.0,
+                                           0.0)  # scale_u can adjust the threshold, it is not used in our paper.
+        unseen_negative_sets = torch.where(masks < (thred_u * scale_u), 1.0, 0.0)
+        easy_positive_sets = unseen_positive_sets
+        easy_negative_sets = unseen_negative_sets
+        hard_positive_sets = unseen_positive_sets
+        hard_negative_sets = unseen_negative_sets
+    #######################################################
+    # --------- determine the number of sampling ----------
+    #######################################################
+    # how many points can be sampled for all proposals for each type of sets
+    num_Epos_ = easy_positive_sets.sum(dim=[2, 3])  # H, W to count points numbers E=easy, H=hard
+    num_Hpos_ = hard_positive_sets.sum(dim=[2, 3])
+    num_Eneg_ = easy_negative_sets.sum(dim=[2, 3])
+    num_Hneg_ = hard_negative_sets.sum(dim=[2, 3])
+    # if available points are less then 5 for each type, this proposal will be dropped out.
+    available_num = torch.cat([num_Epos_, num_Eneg_, num_Hpos_, num_Hneg_])
+    abandon_inds = torch.where(available_num < 5, 1, 0).reshape(4, -1)
+    keeps = torch.logical_not(abandon_inds.sum(0).to(dtype=torch.bool))
+    if True not in keeps:  # all proposals do not have enough points that can be sample. This is a extreme situation.
+        # set the points number of all types sets to 2
+        # sometimes, there would still raise an error. I will fix it later.
+        sample_num_Epos = torch.ones_like(num_Epos_) * 2
+        sample_num_Hpos = torch.ones_like(num_Hpos_) * 2
+        sample_num_Eneg = torch.ones_like(num_Eneg_) * 2
+        sample_num_Hneg = torch.ones_like(num_Hneg_) * 2.
+    else:
+        sample_num_Epos = (percent * num_Epos_[keeps]).ceil()  # percent is the sigma in our paper
+        sample_num_Hpos = (percent * num_Hpos_[keeps]).ceil()
+        sample_num_Eneg = (percent * num_Eneg_[keeps]).ceil()
+        sample_num_Hneg = (percent * num_Hneg_[keeps]).ceil()
+
+    #######################################################
+    # ----------------- sample points ---------------------
+    #######################################################
+    empty_dict = {}
+    easy_positive_sets_N, flag0 = get_pixel_sets_N_myself(easy_positive_sets[keeps], sample_num_Epos)
+    if not flag0:
+        return empty_dict, False
+    easy_negative_sets_N, flag1 = get_pixel_sets_N_myself(easy_negative_sets[keeps], sample_num_Eneg)
+    if not flag1:
+        return empty_dict, False
+    hard_positive_sets_N, flag2 = get_pixel_sets_N_myself(hard_positive_sets[keeps], sample_num_Hpos)
+    if not flag2:
+        return empty_dict, False
+    hard_negative_sets_N, flag3 = get_pixel_sets_N_myself(hard_negative_sets[keeps], sample_num_Hneg)
+    if not flag3:
+        return empty_dict, False
+
+    # Record points number
+    num_per_type = dict()
+    num_per_type['Epos_num_'] = sample_num_Epos
+    num_per_type['Hpos_num_'] = sample_num_Hpos
+    num_per_type['Eneg_num_'] = sample_num_Eneg
+    num_per_type['Hneg_num_'] = sample_num_Hneg
+
+    #######################################################
+    # ------------------- return data ---------------------
+    #######################################################
+    return_result = dict()
+    return_result['keeps'] = keeps  # which proposal is preserved
+    return_result['num_per_type'] = num_per_type
+    return_result['query_pos_sets'] = query_pos_sets[keeps]  # query area for foreground
+    return_result['query_neg_sets'] = query_neg_sets[keeps]  # query area for background
+    return_result['easy_positive_sets_N'] = easy_positive_sets_N.to(dtype=torch.bool)
+    return_result['easy_negative_sets_N'] = easy_negative_sets_N.to(dtype=torch.bool)
+    return_result['hard_positive_sets_N'] = hard_positive_sets_N.to(dtype=torch.bool)
+    return_result['hard_negative_sets_N'] = hard_negative_sets_N.to(dtype=torch.bool)
+    return return_result, True
+
+
+class ContrastiveHead_myself(nn.Module):
+
+    def __init__(self,
+                 num_convs=1,
+                 num_projectfc=2,
+                 in_channels=64,
+                 conv_out_channels=64,
+                 fc_out_channels=64,
+                 thred_u=0.1,
+                 scale_u=1.0,
+                 percent=0.3):
+        super(ContrastiveHead_myself, self).__init__()
+        self.num_convs = num_convs  # layer of encoder
+        self.num_projectfc = num_projectfc  # layers of projector
+        self.in_channels = in_channels  # channels number
+        self.conv_out_channels = conv_out_channels  # out put channels numbers
+        self.fc_out_channels = fc_out_channels
+        self.thred_u = thred_u
+        self.scale_u = scale_u
+        self.percent = percent
+        self.fake = True
+
+        # build encoder module
+        self.encoder = nn.ModuleList()  # make a list to upconv
+        for i in range(self.num_convs):
+            in_channels = (
+                self.in_channels if i == 0 else self.conv_out_channels)
+            self.encoder.append(
+                conv_block(in_channels, self.conv_out_channels))
+            last_layer_dim = self.conv_out_channels
+
+        # build projecter module
+        self.projector = nn.ModuleList()
+        for j in range(self.num_projectfc - 1):
+            fc_in_channels = (
+                last_layer_dim if i == 0 else self.fc_out_channels)
+            self.projector.append(
+                conv_block(fc_in_channels, self.fc_out_channels))
+            last_layer_dim = self.fc_out_channels
+        self.projector.append(linear_block(in_ch=last_layer_dim, out_ch=self.fc_out_channels))
+
+    def forward(self, x, masks, trained, faked):
+        # mask for supervised  and prdict for unsupervised
+        """
+        We get average foreground pixel and background pixel for Quary pixel feature (by mask and thrshold for prdiction)
+        easy by bounary on the boundary and less than
+        """
+        self.fake = faked
+        sample_sets = dict()
+        if self.fake:
+            edges = mask2edge(masks)
+        else:
+            edges = None
+        # 1. get query and keys
+        if trained:  # training phase
+            sample_results, flag = get_query_keys_myself(edges, masks, thred_u=self.thred_u, scale_u=self.scale_u,
+                                                         percent=self.percent, fake=self.fake)
+            if flag == False:
+                return x, sample_results, flag
+            keeps_ = sample_results['keeps']
+            keeps = keeps_.reshape(-1, 1, 1)
+            keeps = keeps.expand(keeps.shape[0], x.shape[2],
+                                 x.shape[3])  # expand the flag(numbers of batch level) for the whole feature
+            keeps_all = keeps.reshape(-1)
+        else:  # evaluation phase
+            sample_results = get_query_keys_eval(masks)
+
+        # 2. forward
+        for conv in self.encoder:
+            x = conv(x)
+        x_pro = self.projector[0](x)
+        for i in range(1, len(self.projector) - 1):
+            x_pro = self.projector[i](x_pro)
+        n, c, h, w = x_pro.shape
+        x_pro = x_pro.permute(0, 2, 3, 1).reshape(-1, c)  # n,c,h,w -> n,h,w,c -> (nhw),c
+        x_pro = self.projector[-1](x_pro)  # (nhw),c
+
+        # 3. get vectors for queries and keys so that we can calculate contrastive loss
+        if trained:
+            query_pos_num = sample_results['query_pos_sets'].to(device=x_pro.device, dtype=x_pro.dtype).sum(dim=[2, 3])
+            query_neg_num = sample_results['query_neg_sets'].to(device=x_pro.device, dtype=x_pro.dtype).sum(dim=[2, 3])
+            sample_easy_pos = x_pro[keeps_all][sample_results['easy_positive_sets_N'].reshape(-1), :]  # *, 256
+            sample_easy_neg = x_pro[keeps_all][sample_results['easy_negative_sets_N'].reshape(-1), :]  # *, 256
+            sample_hard_pos = x_pro[keeps_all][sample_results['hard_positive_sets_N'].reshape(-1), :]  # *, 256
+            sample_hard_neg = x_pro[keeps_all][sample_results['hard_negative_sets_N'].reshape(-1),
+                              :]  # *, 256 choose the True postion feature as sample [oint
+            squeeze_sampletresult = sample_results['query_pos_sets'].squeeze(1)  # 5 256 256 to get the whole pos map
+            query_pos = (x_pro[keeps_all].reshape(-1, 256, 256, 64) * squeeze_sampletresult.to(
+                device=x_pro[keeps_all].device).unsqueeze(3)).sum(dim=[1, 2]) / query_pos_num
+            query_pos_set = x_pro[keeps_all][sample_results['query_pos_sets'].reshape(-1), :]
+            squeeze_negsampletresult = sample_results['query_neg_sets'].squeeze(1)  # 5 256 256
+            query_neg = (x_pro[keeps_all].reshape(-1, 256, 256, 64) * squeeze_negsampletresult.to(
+                device=x_pro[keeps_all].device).unsqueeze(3)).sum(dim=[1, 2]) / query_neg_num
+            query_neg_set = x_pro[keeps_all][sample_results['query_neg_sets'].reshape(-1), :]
+            # sample sets are used to calculate loss
+            sample_sets['keeps_proposal'] = keeps_
+            sample_sets['query_pos'] = query_pos.unsqueeze(1)  # N,HW,C 1,1,64
+            sample_sets['query_neg'] = query_neg.unsqueeze(1)
+            sample_sets['query_pos_set'] = query_pos_set  # N,dims
+            sample_sets['query_neg_set'] = query_neg_set  # N,dims
+            sample_sets['num_per_type'] = sample_results['num_per_type']
+            sample_sets['sample_easy_pos'] = sample_easy_pos  # N,64
+            sample_sets['sample_easy_neg'] = sample_easy_neg
+            sample_sets['sample_hard_pos'] = sample_hard_pos
+            sample_sets['sample_hard_neg'] = sample_hard_neg
+        return x, sample_sets, True
+
+
+class UNet_contrast(nn.Module):
+    """
+    UNet - Basic Implementation
+    Paper : https://arxiv.org/abs/1505.04597
+    """
+
+    def __init__(self, n_channels, n_classes):
+        super(UNet_contrast, self).__init__()
+
+        n1 = 64
+        filters = [n1, n1 * 2, n1 * 4, n1 * 8, n1 * 16]
+
+        self.Maxpool1 = nn.MaxPool2d(kernel_size=2, stride=2)
+        self.Maxpool2 = nn.MaxPool2d(kernel_size=2, stride=2)
+        self.Maxpool3 = nn.MaxPool2d(kernel_size=2, stride=2)
+        self.Maxpool4 = nn.MaxPool2d(kernel_size=2, stride=2)
+
+        self.Conv1 = conv_block(n_channels, filters[0])
+        self.Conv2 = conv_block(filters[0], filters[1])
+        self.Conv3 = conv_block(filters[1], filters[2])
+        self.Conv4 = conv_block(filters[2], filters[3])
+        self.Conv5 = conv_block(filters[3], filters[4])
+
+        self.Up5 = up_conv(filters[4], filters[3])
+        self.Up_conv5 = conv_block(filters[4], filters[3])
+
+        self.Up4 = up_conv(filters[3], filters[2])
+        self.Up_conv4 = conv_block(filters[3], filters[2])
+
+        self.Up3 = up_conv(filters[2], filters[1])
+        self.Up_conv3 = conv_block(filters[2], filters[1])
+
+        self.Up2 = up_conv(filters[1], filters[0])
+        self.Up_conv2 = conv_block(filters[1], filters[0])
+
+        self.Conv = nn.Conv2d(filters[0], n_classes, kernel_size=1, stride=1, padding=0)
+        self.active = torch.nn.Sigmoid()
+        #self.contrast = ContrastiveHead_torch(num_convs=1,num_projectfc=2,thred_u=0.1,scale_u=1.0,percent=0.3) #init the contrast head to conv 8;
+        self.contrast = ContrastiveHead_myself(num_convs=1,num_projectfc=2,thred_u=0.1,scale_u=1.0,percent=0.3)
+
+    def cat_(self,xe,xd):
+        diffY = xe.size()[2] - xd.size()[2]
+        diffX = xe.size()[3] - xd.size()[3]
+        xd = F.pad(xd, (diffX // 2, diffX - diffX // 2, diffY // 2, diffY - diffY // 2))
+        xd = torch.cat((xe, xd), dim=1)
+        return xd
+
+    def forward(self, x, mask, trained,fake):
+        e1 = self.Conv1(x)
+
+        e2 = self.Maxpool1(e1)
+        e2 = self.Conv2(e2)
+
+        e3 = self.Maxpool2(e2)
+        e3 = self.Conv3(e3)
+
+        e4 = self.Maxpool3(e3)
+        e4 = self.Conv4(e4)
+
+        e5 = self.Maxpool4(e4)
+        e5 = self.Conv5(e5)
+
+        d5 = self.Up5(e5)
+        d5 = self.cat_(e4,d5)
+        #d5 = torch.cat((e4, d5), dim=1)
+
+        d5 = self.Up_conv5(d5)
+
+        d4 = self.Up4(d5)
+        d4 = self.cat_(e3, d4)
+        #d4 = torch.cat((e3, d4), dim=1)
+        d4 = self.Up_conv4(d4)
+
+        d3 = self.Up3(d4)
+        d3 = self.cat_(e2, d3)
+        #d3 = torch.cat((e2, d3), dim=1)
+        d3 = self.Up_conv3(d3)
+
+        d2 = self.Up2(d3)
+        d2 = self.cat_(e1, d2)
+        #d2 = torch.cat((e1, d2), dim=1)
+        d2 = self.Up_conv2(d2)
+        #d2 = d2 + contrast_tensor0
+        out = self.Conv(d2)
+        d1 = self.active(out)
+        if trained and fake:
+            contrast_tensor0, sample_sets, flag = self.contrast(d2,mask,trained,fake)
+        elif trained and fake==False:
+            contrast_tensor0, sample_sets, flag = self.contrast(d2, d1, trained, fake)
+        else:
+            contrast_tensor0, sample_sets, flag = self.contrast(d2,d1,trained,fake)
+
+        return d1, sample_sets, flag
+
+
+class Single_contrast_UNet(nn.Module):
+    def __init__(self, n_channels, num_classes):
+        super(Single_contrast_UNet, self).__init__()
+        self.backbone = UNet_contrast(n_channels=n_channels, n_classes=num_classes)
+        self.business_layer = []
+        self.business_layer.append(self.backbone)
+
+    def forward(self, data, mask=None, trained=True, fake=True):
+        pred, sample_set, flag = self.backbone(data, mask, trained, fake)
+        b, c, h, w = data.shape
+        pred = F.interpolate(pred, size=(h, w), mode='bilinear', align_corners=True)
+
+        return pred, sample_set, flag
+
+    # @staticmethod
+    def _nostride_dilate(self, m, dilate):
+        if isinstance(m, nn.Conv2d):
+            if m.stride == (2, 2):
+                m.stride = (1, 1)
+                if m.kernel_size == (3, 3):
+                    m.dilation = (dilate, dilate)
+                    m.padding = (dilate, dilate)
+
+            else:
+                if m.kernel_size == (3, 3):
+                    m.dilation = (dilate, dilate)
+                    m.padding = (dilate, dilate)
+
+# def get_parser():
+#     parser = argparse.ArgumentParser(description='JTFN for Curvilinear Structure Segmentation')
+#     parser.add_argument('--config', type=str, default='config/UNet_DRIVE.yaml', help='Model config file')
+#     args = parser.parse_args()
+#     assert args.config is not None
+#     cfg = config.load_cfg_from_cfg_file(args.config)
+#     return cfg
 
 def write_csv(path, data_row):
     # path  = "aa.csv"
@@ -110,7 +593,7 @@ def train(epoch, Segment_model, predict_Discriminator_model, dataloader_supervis
             minibatch = next(dataloader)
         except StopIteration:
             dataloader = iter(dataloader_supervised)
-            minibatch = dataloader.next()
+            minibatch = next(dataloader)
 
         imgs = minibatch['img']
         gts = minibatch['anno_mask']
@@ -122,10 +605,10 @@ def train(epoch, Segment_model, predict_Discriminator_model, dataloader_supervis
             weight_mask[weight_mask == 1] = 1
             criterion_bce = nn.BCELoss(weight=weight_mask)
         try:
-            unsup_minibatch = unsupervised_dataloader.next()
+            unsup_minibatch = next(unsupervised_dataloader)
         except StopIteration:
             unsupervised_dataloader = iter(dataloader_unsupervised)
-            unsup_minibatch = unsupervised_dataloader.next()
+            unsup_minibatch = next(unsupervised_dataloader)
 
         unsup_imgs = unsup_minibatch['img']
         unsup_imgs = unsup_imgs.cuda(non_blocking=True)
@@ -222,12 +705,12 @@ def train(epoch, Segment_model, predict_Discriminator_model, dataloader_supervis
 
 # evaluate(epoch, model, dataloader_val,criterion,criterion_consist)
 def evaluate(epoch, Segment_model, predict_Discriminator_model, val_target_loader, criterion):
-    if torch.cuda.device_count() > 1:
-        Segment_model.module.eval()
-        predict_Discriminator_model.module.eval()
-    else:
-        Segment_model.eval()
-        predict_Discriminator_model.eval()
+    #if torch.cuda.device_count() > 1:
+        #Segment_model.module.eval()
+        #predict_Discriminator_model.module.eval()
+    #else:
+    Segment_model.eval()
+    predict_Discriminator_model.eval()
     with torch.no_grad():
         val_sum_loss_sup = 0
         val_sum_f1 = 0
@@ -359,15 +842,15 @@ def main():
 
     average_posregion = torch.zeros((1, 128))
     average_negregion = torch.zeros((1, 128))
-    if torch.cuda.device_count() > 1:
-        Segment_model = Segment_model.cuda()
-        Segment_model = nn.DataParallel(Segment_model)
-        average_posregion.cuda()
-        average_negregion.cuda()
-        predict_Discriminator_model = predict_Discriminator_model.cuda()
-        predict_Discriminator_model = nn.DataParallel(predict_Discriminator_model)
+    #if torch.cuda.device_count() > 1:多GPU
+        #Segment_model = Segment_model.cuda()
+        #Segment_model = nn.DataParallel(Segment_model)
+        #average_posregion.cuda()
+        #average_negregion.cuda()
+        #predict_Discriminator_model = predict_Discriminator_model.cuda()
+        #predict_Discriminator_model = nn.DataParallel(predict_Discriminator_model)
         # Logger.info('Use GPU Parallel.')
-    elif torch.cuda.is_available():
+    if torch.cuda.is_available():
         print("cuda_is available")
         Segment_model = Segment_model.cuda()
         average_posregion.cuda()
@@ -382,7 +865,7 @@ def main():
     Logger.initialize(config, training=True)
     val_score_path = os.path.join('logs', config.logname + '.log') + '/' + 'val_train_f1.csv'
     csv_head = ["epoch", "total_loss", "f1", "AUC", "pr", "recall", "Acc", "Sp", "JC"]
-    create_csv(val_score_path, csv_head)
+    write_csv(val_score_path, csv_head)
     for epoch in range(config.state_epoch, config.nepochs):
         # train_loss_sup, train_loss_consis, train_total_loss
         train_loss_seg, train_loss_Dtar, train_loss_Dsrc, train_loss_adv, train_total_loss, train_loss_dice, train_loss_ce, train_loss_contrast, average_posregion, average_negregion = train(

@@ -636,7 +636,7 @@ def get_pixel_sets_N_myself(src_sets, select_num):
         for idx, keeps in enumerate(keeps_all):
             keeps_init = np.zeros_like(keeps.cpu())  # For 1204
             src_set_index = np.arange(len(keeps))
-            src_set_index_keeps = src_set_index[keeps.cpu().numpy().astype(np.bool)]  # For 1204
+            src_set_index_keeps = src_set_index[keeps.cpu().numpy().astype(np.bool_)]  # For 1204
             select_num[idx] = int(select_num[idx]) if int(select_num[idx]) < 500 else 500
             resultList = random.sample(range(0, len(src_set_index_keeps)), int(select_num[idx]))
             src_set_index_keeps_select = src_set_index_keeps[resultList]

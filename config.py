@@ -76,9 +76,9 @@ C.image_mean = np.array([0.485, 0.456, 0.406])  # 0.485, 0.456, 0.406
 C.image_std = np.array([0.229, 0.224, 0.225])
 C.image_height = 256
 C.image_width = 256
-C.num_train_imgs = 150 // C.labeled_ratio #XCAD
-C.num_eval_imgs = 126#XCAD
-C.num_unsup_imgs = 1621 #XCAD
+C.num_train_imgs = 160 // C.labeled_ratio #XCAD
+C.num_eval_imgs = 46#XCAD
+C.num_unsup_imgs = 160 #XCAD
 
 """Train Config"""
 C.lr = 0.01
