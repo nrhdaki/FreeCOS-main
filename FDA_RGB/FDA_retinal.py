@@ -150,8 +150,8 @@ def replace_color_binary(img, src_clr = [0,0,0],dst_clr = [255,255,255]):
 # Save_image = "./FDA_retinal_image/"
 # Save_label = "./FDA_retinal_label/"
 
-src_file = "D://Project_code//Generator_vessel//make_fake_vessel_code//fake_vessel_image_IOSTARrgb//"
-tar_file = "D://Project_code//Generator_vessel//make_fake_vessel_code//IOSTAR_rgbcrop//train//"
+src_file = "/workspace/yangyi/FreeCOS-main/Data/CrackTree/train/fake_ftvessel/"
+tar_file = "./Data/CrackTree/train/img/"
 Save_image = "./FDA_retinalIOSTAR_rgbimage/"
 Save_label = "./FDA_retinalIOSTAR_rgblabel/"
 if not os.path.exists(Save_image):

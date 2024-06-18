@@ -692,6 +692,14 @@ def train(epoch, Segment_model, predict_Discriminator_model, dataloader_supervis
 
         end_time = time.time()
 
+    if (epoch + 1) % 10 == 0:
+        current_time = datetime.now().strftime("%Y%m%d-%H%M%S")
+        output_dir = f"/workspace/yangyi/FreeCOS-main/output/output_{current_time}"
+        os.makedirs(output_dir, exist_ok=True)
+        save_image(pred_sup_l, os.path.join(output_dir, f"pred_sup_l_epoch_{epoch+1}.png"))
+        save_image(pred_target, os.path.join(output_dir, f"pred_target_epoch_{epoch+1}.png"))
+
+
     train_loss_seg = sum_loss_seg / len(pbar)
     train_loss_Dtar = sum_Dtar_loss / len(pbar)
     train_loss_Dsrc = sum_Dsrc_loss / len(pbar)
@@ -762,6 +770,10 @@ def evaluate(epoch, Segment_model, predict_Discriminator_model, val_target_loade
 
 
 def main():
+    current_time = datetime.now().strftime('%Y%m%d-%H%M%S')
+    tbd_writer = SummaryWriter('/workspace/yangyi/FreeCOS-main/yy_log/output'+ current_time)
+
+
     if os.getenv('debug') is not None:
         is_debug = os.environ['debug']
     else:
@@ -895,6 +907,22 @@ def main():
             best_val_f1 = val_mean_f1
             Logger.save_model_f1_S(Segment_model, epoch, val_mean_f1, optimizer_l)
             Logger.save_model_f1_T(predict_Discriminator_model, epoch, val_mean_f1, optimizer_D)
+
+        tbd_writer.add_scalar('f1',val_mean_f1.item(),epoch)
+        tbd_writer.add_scalar('AUC',val_mean_AUC,epoch)
+        tbd_writer.add_scalar('PR',val_mean_pr.item(),epoch)
+        tbd_writer.add_scalar('RE',val_mean_re.item(),epoch)
+        tbd_writer.add_scalar('ACC',val_mean_acc.item(),epoch)
+        tbd_writer.add_scalar('Loss',train_total_loss,epoch)
+        tbd_writer.add_scalar('JC',val_mean_jc,epoch)
+        '''
+            logger = Logger()
+            logger.write_result("Train", epoch)
+            logger.write_result("Validation", epoch)
+        '''
+       
+      
+      
         # if val_mean_AUC > best_val_AUC:
         #     best_val_AUC = val_mean_AUC
         #     Logger.save_model_f1_S(Segment_model, epoch, val_mean_AUC, optimizer_l)
